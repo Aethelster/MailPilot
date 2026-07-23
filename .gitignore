@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+settings.json
+token.json
+credentials.json
+outlook_credentials.json
+accounts/
+summaries/
+credentials/
+ozet-loglari/
+build/
+dist/
+*.spec
+MailPilot-EXE/
