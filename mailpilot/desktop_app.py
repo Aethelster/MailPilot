@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import html
 import os
 import sys
@@ -1100,6 +1100,8 @@ class MailPilotWindow(QMainWindow):
         self.scan_thread: threading.Thread | None = None
         self.report_thread: threading.Thread | None = None
         self.report_popup: ReportPopup | None = None
+        self.pending_daily_report_date: str | None = None
+        self.daily_report_retry_after: datetime | None = None
         self.force_quit = False
         self.account_flow_active = False
         self.scan_started_at: datetime | None = None
@@ -1124,6 +1126,7 @@ class MailPilotWindow(QMainWindow):
         self.scheduler = QTimer(self)
         self.scheduler.timeout.connect(self.check_schedule)
         self.scheduler.start(30_000)
+        QTimer.singleShot(1_000, self.check_schedule)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -1327,6 +1330,10 @@ class MailPilotWindow(QMainWindow):
         self.account_input.addItem(_icon("plus.svg"), "E-posta ekle", ADD_ACCOUNT_ITEM)
         active = self.settings.active_account_id
         index = self.account_input.findData(active)
+        if index < 0 and accounts:
+            index = 0
+            self.settings.active_account_id = accounts[0].get("id")
+            self.settings.save()
         self.account_input.setCurrentIndex(index if index >= 0 else self.account_input.count() - 1)
         self.account_input.setMaxVisibleItems(max(4, self.account_input.count()))
         self.account_input.blockSignals(False)
@@ -2111,22 +2118,31 @@ class MailPilotWindow(QMainWindow):
         self.refresh_status_labels()
 
     def check_schedule(self) -> None:
-        current_day = date.today().isoformat()
-        now_slot = datetime.now().strftime("%H:%M")
+        now = datetime.now()
+        current_day = now.date().isoformat()
+        now_slot = now.strftime("%H:%M")
         if self.settings.enabled and now_slot in self.settings.summary_times:
             key = f"{current_day}-{now_slot}"
             if key not in self.ran_slots:
                 self.ran_slots.add(key)
                 self.scan_now()
-        if self.settings.enabled and now_slot == self.settings.daily_report_time:
-            if self.settings.last_daily_report_date != current_day:
-                self.settings.mark_daily_report_now()
-                if not self.is_app_foreground():
-                    self.start_report_popup_scan()
-                else:
-                    self.write_log("Günlük rapor saati geldi, uygulama açık olduğu için pop-up gösterilmedi.")
+        if self.settings.enabled and self._daily_report_due(now):
+            self.start_report_popup_scan(force=True, daily_report_date=current_day)
         old_days = {slot for slot in self.ran_slots if not slot.startswith(current_day)}
         self.ran_slots.difference_update(old_days)
+
+    def _daily_report_due(self, now: datetime) -> bool:
+        if self.settings.last_daily_report_date == now.date().isoformat():
+            return False
+        if self.pending_daily_report_date == now.date().isoformat():
+            return False
+        if self.daily_report_retry_after and now < self.daily_report_retry_after:
+            return False
+        try:
+            report_time = datetime.strptime(self.settings.daily_report_time, "%H:%M").time()
+        except ValueError:
+            return False
+        return now.time() >= report_time
 
     def open_summaries(self) -> None:
         os.startfile(summaries_path())
@@ -2217,12 +2233,17 @@ class MailPilotWindow(QMainWindow):
         self.save_settings()
         self.start_report_popup_scan(force=True)
 
-    def start_report_popup_scan(self, force: bool = False) -> None:
+    def start_report_popup_scan(self, force: bool = False, daily_report_date: str | None = None) -> None:
         if self.report_thread and self.report_thread.is_alive():
+            if daily_report_date:
+                self.pending_daily_report_date = daily_report_date
             self.write_log("Mini rapor taraması zaten çalışıyor.")
             return
         if not force and self.is_app_foreground():
             return
+        self.pending_daily_report_date = daily_report_date
+        if daily_report_date:
+            self.daily_report_retry_after = None
         self.report_popup = ReportPopup(self)
         self.report_popup.setStyleSheet(DARK_STYLE if self.settings.theme == "dark" else LIGHT_STYLE)
         self.report_popup.show()
@@ -2271,10 +2292,17 @@ class MailPilotWindow(QMainWindow):
         self.report_popup.set_summary(html_body)
         self.report_popup.show()
         self.report_popup.raise_()
+        if self.pending_daily_report_date == date.today().isoformat():
+            self.settings.mark_daily_report_now()
+            self.pending_daily_report_date = None
+            self.daily_report_retry_after = None
         self.write_log("Mini rapor hazır.")
         self.refresh_status_labels()
 
     def show_report_error(self, text: str) -> None:
+        if self.pending_daily_report_date == date.today().isoformat():
+            self.daily_report_retry_after = datetime.now() + timedelta(minutes=15)
+        self.pending_daily_report_date = None
         if not self.report_popup:
             self.report_popup = ReportPopup(self)
         self.report_popup.set_message(f"Mini rapor hazırlanamadı:\n\n{text}")

@@ -16,10 +16,12 @@ def set_enabled(enabled: bool, app_dir: Path) -> None:
     STARTUP_DIR.mkdir(parents=True, exist_ok=True)
     if enabled:
         exe = app_dir / "MailPilot.exe"
-        script = exe if exe.exists() else app_dir / "run_hidden.vbs"
+        if not exe.exists():
+            raise FileNotFoundError(f"MailPilot.exe bulunamadı: {exe}")
         STARTUP_FILE.write_text(
             f'Set shell = CreateObject("WScript.Shell")\n'
-            f'shell.Run """{script}"" --tray", 0, False\n',
+            f'shell.CurrentDirectory = "{app_dir}"\n'
+            f'shell.Run """{exe}"" --tray", 0, False\n',
             encoding="utf-8",
         )
         return
