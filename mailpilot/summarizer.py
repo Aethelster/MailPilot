@@ -572,7 +572,7 @@ TAG_CLASSES = {
 
 def _general_html(body: str) -> str:
     return f"""
-    <div style="font-family:'Plus Jakarta Sans','Segoe UI',Arial; font-size:14px; line-height:1.55; color:inherit;">
+    <div style="font-family:'Segoe UI Variable Text','Segoe UI',Arial; font-size:14px; line-height:1.55; color:inherit;">
       {body}
     </div>
     """
@@ -585,7 +585,7 @@ def _html_page(body: str) -> str:
 <style>
 body {{
   margin: 0;
-  font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif;
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
   color: #111827;
   background: transparent;
 }}

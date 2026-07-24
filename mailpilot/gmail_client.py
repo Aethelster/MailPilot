@@ -17,10 +17,16 @@ from .config import CREDENTIALS_DIR, Settings, SUMMARIES_DIR, ensure_runtime_lay
 
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+GOOGLE_ACCOUNT_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
 CREDENTIALS_PATH = CREDENTIALS_DIR / "credentials.json"
 OUTLOOK_CREDENTIALS_PATH = CREDENTIALS_DIR / "outlook_credentials.json"
 TOKEN_PATH = CREDENTIALS_DIR / "token.json"
 ACCOUNTS_DIR = CREDENTIALS_DIR / "accounts"
+AVATARS_DIR = ACCOUNTS_DIR / "avatars"
 OUTLOOK_SCOPES = ["offline_access", "User.Read", "Mail.Read"]
 
 
@@ -53,21 +59,22 @@ def _load_google_modules():
     return Request, Credentials, InstalledAppFlow, build
 
 
-def build_service(settings: Settings | None = None, account_id: str | None = None):
+def build_service(settings: Settings | None = None, account_id: str | None = None, scopes: list[str] | None = None):
     ensure_runtime_layout()
     Request, Credentials, InstalledAppFlow, build = _load_google_modules()
     if not CREDENTIALS_PATH.exists():
         raise GmailNotReady("credentials.json bulunamadı. Google OAuth dosyasını uygulama klasörüne koy.")
 
+    scopes = scopes or SCOPES
     token_path = _token_path(settings, account_id)
     creds = None
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), scopes)
             creds = flow.run_local_server(port=0)
         token_path.parent.mkdir(exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
@@ -111,7 +118,7 @@ def fetch_messages(settings: Settings) -> list[dict[str, Any]]:
 
 
 def add_gmail_account(settings: Settings) -> dict[str, str]:
-    service = build_service(settings, account_id="new")
+    service = build_service(settings, account_id="new", scopes=GOOGLE_ACCOUNT_SCOPES)
     profile = service.users().getProfile(userId="me").execute()
     email = profile.get("emailAddress", "gmail")
     account_id = _account_id(email)
@@ -121,6 +128,9 @@ def add_gmail_account(settings: Settings) -> dict[str, str]:
         final_token.parent.mkdir(exist_ok=True)
         new_token.replace(final_token)
     account = {"id": account_id, "email": email, "provider": "gmail"}
+    avatar_path = _fetch_google_avatar(final_token, account_id)
+    if avatar_path:
+        account["avatar_path"] = avatar_path
     settings.email_accounts = [item for item in settings.email_accounts if item.get("id") != account_id]
     settings.email_accounts.append(account)
     settings.active_account_id = account_id
@@ -176,6 +186,9 @@ def finish_outlook_device_login(settings: Settings, device: dict[str, Any], clie
     token_path.parent.mkdir(exist_ok=True)
     token_path.write_text(json.dumps(token, indent=2), encoding="utf-8")
     settings.email_accounts = [item for item in settings.email_accounts if item.get("id") != account_id]
+    avatar_path = _fetch_outlook_avatar(token["access_token"], account_id)
+    if avatar_path:
+        account["avatar_path"] = avatar_path
     settings.email_accounts.append(account)
     settings.active_account_id = account_id
     settings.save()
@@ -205,10 +218,34 @@ def ensure_default_gmail_account(settings: Settings) -> dict[str, str] | None:
     if not final_token.exists():
         shutil.copy2(TOKEN_PATH, final_token)
     account = {"id": account_id, "email": email, "provider": "gmail"}
+    avatar_path = _fetch_google_avatar(final_token, account_id)
+    if avatar_path:
+        account["avatar_path"] = avatar_path
     settings.email_accounts = [account]
     settings.active_account_id = account_id
     settings.save()
     return account
+
+
+def ensure_account_avatar(settings: Settings, account: dict[str, str]) -> bool:
+    account_id = account.get("id")
+    if not account_id:
+        return False
+    avatar_path: str | None = None
+    if account.get("provider") == "outlook":
+        avatar_path = _fetch_outlook_avatar(_outlook_access_token(account), account_id)
+    else:
+        avatar_path = _fetch_google_avatar(_account_token_path(account_id), account_id)
+    if not avatar_path:
+        return False
+    changed = False
+    for item in settings.email_accounts:
+        if item.get("id") == account_id and item.get("avatar_path") != avatar_path:
+            item["avatar_path"] = avatar_path
+            changed = True
+    if changed:
+        settings.save()
+    return changed
 
 
 def _token_path(settings: Settings | None, account_id: str | None = None):
@@ -221,6 +258,11 @@ def _token_path(settings: Settings | None, account_id: str | None = None):
 def _account_token_path(account_id: str):
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", account_id)
     return ACCOUNTS_DIR / f"{safe}.json"
+
+
+def _account_avatar_path(account_id: str, suffix: str):
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", account_id)
+    return AVATARS_DIR / f"{safe}{suffix}"
 
 
 def _account_id(email: str) -> str:
@@ -276,6 +318,72 @@ def _outlook_get(url: str, access_token: str) -> dict[str, Any]:
         payload = json.loads(exc.read().decode("utf-8", errors="replace") or "{}")
         message = payload.get("error", {}).get("message") or payload.get("error_description") or str(exc)
         raise GmailNotReady(f"Outlook hatası: {message}") from exc
+
+
+def _fetch_google_avatar(token_path, account_id: str) -> str | None:
+    try:
+        token = json.loads(token_path.read_text(encoding="utf-8"))
+        access_token = token.get("access_token")
+        if not access_token:
+            return None
+        request = UrlRequest(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        )
+        with urlopen(request, timeout=20) as response:
+            profile = json.loads(response.read().decode("utf-8"))
+        picture_url = profile.get("picture")
+        if not picture_url:
+            return None
+        return _download_avatar(picture_url, account_id, access_token=None)
+    except Exception:
+        return None
+
+
+def _fetch_outlook_avatar(access_token: str, account_id: str) -> str | None:
+    try:
+        request = UrlRequest(
+            "https://graph.microsoft.com/v1.0/me/photo/$value",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        with urlopen(request, timeout=20) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type", "")
+        return _write_avatar(data, account_id, _avatar_suffix(content_type))
+    except Exception:
+        return None
+
+
+def _download_avatar(url: str, account_id: str, access_token: str | None = None) -> str | None:
+    headers = {"User-Agent": "MailPilot"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    try:
+        request = UrlRequest(url, headers=headers)
+        with urlopen(request, timeout=20) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type", "")
+        return _write_avatar(data, account_id, _avatar_suffix(content_type))
+    except Exception:
+        return None
+
+
+def _write_avatar(data: bytes, account_id: str, suffix: str) -> str | None:
+    if not data:
+        return None
+    AVATARS_DIR.mkdir(parents=True, exist_ok=True)
+    path = _account_avatar_path(account_id, suffix)
+    path.write_bytes(data)
+    return str(path)
+
+
+def _avatar_suffix(content_type: str) -> str:
+    content_type = content_type.lower()
+    if "png" in content_type:
+        return ".png"
+    if "webp" in content_type:
+        return ".webp"
+    return ".jpg"
 
 
 def _outlook_access_token(account: dict[str, str]) -> str:

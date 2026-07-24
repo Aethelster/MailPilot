@@ -8,8 +8,8 @@ import sys
 import threading
 import webbrowser
 
-from PySide6.QtCore import QDate, QEasingCurve, QEvent, QLocale, QObject, QPropertyAnimation, QRectF, QSize, QTimer, Qt, Signal, Property
-from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QDate, QEasingCurve, QEvent, QLocale, QLockFile, QObject, QPropertyAnimation, QRectF, QSize, QTimer, Qt, Signal, Property
+from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,6 +50,7 @@ from .gmail_client import (
     ensure_default_gmail_account,
     fetch_messages,
     finish_outlook_device_login,
+    ensure_account_avatar,
     summaries_path,
 )
 from .startup import is_enabled as startup_is_enabled
@@ -63,6 +64,9 @@ ADD_ACCOUNT_ITEM = "__mailpilot_add_account__"
 APP_ICON_PATH = APP_DIR / "assets" / "brand" / "logo" / "mailpilot.ico"
 TRAY_ICON_DIR = APP_DIR / "assets" / "brand" / "tray"
 TRAY_ICON_PATH = APP_DIR / "assets" / "brand" / "tray" / "mailpilot-tray.ico"
+INSTANCE_LOCK_PATH = CREDENTIALS_DIR / "MailPilot.lock"
+INSTANCE_RESTORE_PATH = CREDENTIALS_DIR / "MailPilot.restore"
+INSTANCE_LOCK: QLockFile | None = None
 
 
 def _icon(name: str) -> QIcon:
@@ -88,9 +92,17 @@ def _safe_font(family: str, point_size: int, weight: QFont.Weight | int | None =
     return font
 
 
+def _request_existing_instance_restore() -> None:
+    try:
+        CREDENTIALS_DIR.mkdir(exist_ok=True)
+        INSTANCE_RESTORE_PATH.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    except Exception:
+        pass
+
+
 BASE_STYLE = """
 * {
-  font-family: "Plus Jakarta Sans", "Segoe UI", "Inter", "Arial";
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", "Arial";
   font-size: 13px;
   letter-spacing: 0px;
 }
@@ -823,6 +835,7 @@ class ScanSignals(QObject):
     report_error = Signal(str)
     notify = Signal(str, str)
     finished = Signal()
+    avatars_updated = Signal()
 
 
 class ReportPopup(QDialog):
@@ -875,7 +888,7 @@ class ReportPopup(QDialog):
             if accounts:
                 email = accounts[0].get("email", "Mail hesabı")
                 icon = QLabel()
-                icon.setPixmap(self.parent_window._account_icon(email).pixmap(28, 28))
+                icon.setPixmap(self.parent_window._account_icon(accounts[0]).pixmap(28, 28))
                 text = QLabel(email)
                 text.setObjectName("HelpText")
                 layout.addWidget(icon)
@@ -888,7 +901,7 @@ class ReportPopup(QDialog):
         combo = QComboBox()
         for account in accounts:
             email = account.get("email", "mail")
-            combo.addItem(self.parent_window._account_icon(email), email, account.get("id"))
+            combo.addItem(self.parent_window._account_icon(account), email, account.get("id"))
         combo.setCurrentIndex(max(0, combo.findData(self.parent_window.settings.active_account_id)))
         combo.currentIndexChanged.connect(lambda: self.parent_window.on_report_account_changed(combo.currentData()))
         return combo
@@ -1117,6 +1130,7 @@ class MailPilotWindow(QMainWindow):
         self.signals.report_error.connect(self.show_report_error)
         self.signals.notify.connect(self.show_notification)
         self.signals.finished.connect(self.scan_finished)
+        self.signals.avatars_updated.connect(self.refresh_account_picker)
 
         self._build_ui()
         self._build_tray()
@@ -1126,7 +1140,11 @@ class MailPilotWindow(QMainWindow):
         self.scheduler = QTimer(self)
         self.scheduler.timeout.connect(self.check_schedule)
         self.scheduler.start(30_000)
+        self.instance_command_timer = QTimer(self)
+        self.instance_command_timer.timeout.connect(self.check_instance_restore_request)
+        self.instance_command_timer.start(700)
         QTimer.singleShot(1_000, self.check_schedule)
+        QTimer.singleShot(1_500, self.refresh_missing_avatars)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -1325,7 +1343,7 @@ class MailPilotWindow(QMainWindow):
         self.account_input.setEnabled(True)
         for account in accounts:
             email = account.get("email", "mail")
-            self.account_input.addItem(self._account_icon(email), email, account.get("id"))
+            self.account_input.addItem(self._account_icon(account), email, account.get("id"))
         self.account_input.insertSeparator(self.account_input.count())
         self.account_input.addItem(_icon("plus.svg"), "E-posta ekle", ADD_ACCOUNT_ITEM)
         active = self.settings.active_account_id
@@ -1348,7 +1366,36 @@ class MailPilotWindow(QMainWindow):
         if account:
             self.write_log(f"Gmail hesabı bağlandı: {account.get('email')}")
 
-    def _account_icon(self, email: str) -> QIcon:
+    def _account_icon(self, account: dict[str, str] | str) -> QIcon:
+        if isinstance(account, dict):
+            email = account.get("email", "mail")
+            avatar_path = account.get("avatar_path")
+        else:
+            email = account
+            avatar_path = None
+        if avatar_path and os.path.exists(avatar_path):
+            avatar = QPixmap(avatar_path)
+            if not avatar.isNull():
+                size = 28
+                source = avatar.scaled(
+                    size,
+                    size,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                pixmap = QPixmap(size, size)
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                path = QPainterPath()
+                path.addEllipse(0, 0, size, size)
+                painter.setClipPath(path)
+                x = (size - source.width()) // 2
+                y = (size - source.height()) // 2
+                painter.drawPixmap(x, y, source)
+                painter.end()
+                return QIcon(pixmap)
+
         letter = (email.strip()[:1] or "M").upper()
         colors = ["#60a5fa", "#a78bfa", "#34d399", "#f59e0b", "#f472b6"]
         color = colors[sum(ord(ch) for ch in email) % len(colors)]
@@ -1360,10 +1407,27 @@ class MailPilotWindow(QMainWindow):
         painter.setBrush(QColor(color))
         painter.drawEllipse(1, 1, 26, 26)
         painter.setPen(QColor("#ffffff"))
-        painter.setFont(_safe_font("Plus Jakarta Sans", 11, QFont.Weight.Bold))
+        painter.setFont(_safe_font("Segoe UI", 11, QFont.Weight.Bold))
         painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, letter)
         painter.end()
         return QIcon(pixmap)
+
+    def refresh_missing_avatars(self) -> None:
+        if not self.settings.email_accounts:
+            return
+        threading.Thread(target=self._refresh_missing_avatars_worker, daemon=True).start()
+
+    def _refresh_missing_avatars_worker(self) -> None:
+        updated = False
+        for account in list(self.settings.email_accounts):
+            if account.get("avatar_path") and os.path.exists(account["avatar_path"]):
+                continue
+            try:
+                updated = ensure_account_avatar(self.settings, account) or updated
+            except Exception:
+                continue
+        if updated:
+            self.signals.avatars_updated.emit()
 
     def add_gmail_account_from_ui(self) -> None:
         self.account_popover.hide()
@@ -2117,6 +2181,15 @@ class MailPilotWindow(QMainWindow):
         self.scan_started_at = None
         self.refresh_status_labels()
 
+    def check_instance_restore_request(self) -> None:
+        if not INSTANCE_RESTORE_PATH.exists():
+            return
+        try:
+            INSTANCE_RESTORE_PATH.unlink()
+        except OSError:
+            pass
+        self.restore_from_tray()
+
     def check_schedule(self) -> None:
         now = datetime.now()
         current_day = now.date().isoformat()
@@ -2159,17 +2232,38 @@ class MailPilotWindow(QMainWindow):
         self.write_log("Uygulama simge alanına küçültüldü.")
 
     def restore_from_tray(self) -> None:
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
         self.showNormal()
         self.raise_()
         self.activateWindow()
         self.write_log("Uygulama simgeden açıldı.")
+        QTimer.singleShot(120, self._raise_after_tray_restore)
+        QTimer.singleShot(350, self._raise_after_tray_restore)
+
+    def _raise_after_tray_restore(self) -> None:
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
 
     def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in {
             QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.DoubleClick,
+            QSystemTrayIcon.ActivationReason.MiddleClick,
         }:
             self.restore_from_tray()
+
+    def notify_started_in_tray(self) -> None:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.showMessage(
+                "MailPilot çalışıyor",
+                "Arka planda simge alanında başladı. Açmak için MailPilot simgesine tıkla.",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
+        self.write_log("MailPilot Windows ile simge alanında başlatıldı.")
 
     def quit_app(self) -> None:
         self.force_quit = True
@@ -2400,27 +2494,31 @@ class MailPilotWindow(QMainWindow):
 
 
 def main() -> None:
+    global INSTANCE_LOCK
     QLocale.setDefault(QLocale(QLocale.Language.Turkish, QLocale.Country.Turkey))
     app = QApplication(sys.argv)
     app.setApplicationName("MailPilot")
     app.setQuitOnLastWindowClosed(False)
+    CREDENTIALS_DIR.mkdir(exist_ok=True)
+    instance_lock = QLockFile(str(INSTANCE_LOCK_PATH))
+    if not instance_lock.tryLock(100):
+        _request_existing_instance_restore()
+        return
+    INSTANCE_LOCK = instance_lock
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-    font_family = "Segoe UI"
+    font_family = "Segoe UI Variable Text"
     for font_path in (
-        APP_DIR / "assets" / "fonts" / "PlusJakartaSans.ttf",
         APP_DIR / "assets" / "fonts" / "OrangeAvenueDEMO-Regular.otf",
     ):
         if font_path.exists():
-            font_id = QFontDatabase.addApplicationFont(str(font_path))
-            families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
-            if "Plus" in font_path.name and families:
-                font_family = families[0]
+            QFontDatabase.addApplicationFont(str(font_path))
     app_font = _safe_font(font_family, 10)
     app.setFont(app_font)
     window = MailPilotWindow()
     if window.settings.start_minimized_to_tray and "--tray" in sys.argv:
         window.hide()
+        QTimer.singleShot(1_200, window.notify_started_in_tray)
     else:
         window.show()
     sys.exit(app.exec())
