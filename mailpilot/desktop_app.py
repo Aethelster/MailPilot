@@ -2232,17 +2232,20 @@ class MailPilotWindow(QMainWindow):
         self.write_log("Uygulama simge alanına küçültüldü.")
 
     def restore_from_tray(self) -> None:
-        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
-        self.show()
+        self.setWindowState(Qt.WindowState.WindowNoState)
         self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        self._raise_after_tray_restore()
         self.write_log("Uygulama simgeden açıldı.")
         QTimer.singleShot(120, self._raise_after_tray_restore)
         QTimer.singleShot(350, self._raise_after_tray_restore)
 
     def _raise_after_tray_restore(self) -> None:
         if not self.isVisible():
+            self.showNormal()
+        if sys.platform.startswith("win"):
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            self.show()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
             self.show()
         self.raise_()
         self.activateWindow()
